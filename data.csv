@@ -5,11 +5,11 @@ Level_0_C,Level_1_C,120
 Level_0_C,Level_1_D,90
 Level_0_D,Level_1_E,110
 Level_0_D,Level_1_F,85
-Level_1_A,Level_2_A,250
-Level_1_A,Level_2_B,50
+Level_1_A,Level_2_A1,250
+Level_1_A,Level_2_A2,50
 Level_1_B,Level_2_C,200
 Level_1_B,Level_2_D,130
-Level_1_C,Level_2_A,120
+Level_1_C,Level_2_A1,120
 Level_1_D,Level_2_C,45
 Level_1_D,Level_2_B,45
 Level_1_E,Level_2_D,110

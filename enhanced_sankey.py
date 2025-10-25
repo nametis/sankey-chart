@@ -62,6 +62,9 @@ class EnhancedSankeyChart:
         # Determine node levels
         self.node_levels = self._determine_node_levels(all_nodes)
         
+        # Calculate node flow totals
+        self._calculate_node_flow_totals()
+        
         # Calculate node colors based on the new system
         self._calculate_node_colors()
         
@@ -100,6 +103,22 @@ class EnhancedSankeyChart:
             node_levels[node] = 1
         
         return node_levels
+    
+    def _calculate_node_flow_totals(self):
+        """Calculate total flow values for each node"""
+        if self.data is None:
+            return
+        
+        self.node_flow_totals = {}
+        all_nodes = set(self.data['Source'].unique()) | set(self.data['Target'].unique())
+        
+        for node in all_nodes:
+            # Calculate incoming flow (as target)
+            incoming = self.data[self.data['Target'] == node]['Value'].sum()
+            # Calculate outgoing flow (as source)  
+            outgoing = self.data[self.data['Source'] == node]['Value'].sum()
+            # Total flow is the maximum of incoming or outgoing
+            self.node_flow_totals[node] = max(incoming, outgoing)
     
     def _calculate_node_colors(self):
         """Calculate colors for all nodes based on the new color system"""
@@ -214,23 +233,56 @@ class EnhancedSankeyChart:
         # Create node colors list in the correct order
         node_color_list = [self.node_colors.get(node, self.color_config.default_color) for node in all_nodes]
         
-        # Create the Sankey diagram with vanilla positioning
+        # Create enhanced labels with flow totals
+        enhanced_labels = []
+        for node in all_nodes:
+            flow_total = self.node_flow_totals.get(node, 0)
+            if flow_total > 0:
+                # Convert to thousands and format appropriately
+                flow_k = flow_total / 1000
+                if flow_k >= 1:
+                    # Show as k€ for values >= 1000
+                    enhanced_label = f"<b>{node}</b><br><span style='font-size:10px; font-weight:normal;'>{flow_k:.1f}k€</span>"
+                else:
+                    # Show as € for values < 1000
+                    enhanced_label = f"<b>{node}</b><br><span style='font-size:10px; font-weight:normal;'>{flow_total}€</span>"
+            else:
+                enhanced_label = f"<b>{node}</b>"
+            enhanced_labels.append(enhanced_label)
+        
+        # Create slightly transparent link colors
+        transparent_link_colors = []
+        for color in self.link_colors:
+            # Convert hex to rgba with 70% opacity
+            if color.startswith('#'):
+                hex_color = color.lstrip('#')
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                transparent_color = f"rgba({r}, {g}, {b}, 0.7)"
+            else:
+                transparent_color = color
+            transparent_link_colors.append(transparent_color)
+        
+        # Create the Sankey diagram with custom level positioning
         fig = go.Figure(data=[go.Sankey(
             node=dict(
-                pad=55,
-                thickness=10,
-                line=dict(color="white", width=0),
-                label=all_nodes,
+                pad=35,
+                thickness=30,
+                line=dict(color="rgba(0,0,0,0)", width=0),
+                label=enhanced_labels,
                 color=node_color_list,
                 hovertemplate='<b>%{label}</b><br>Value: %{value}<br>Level: %{customdata}<extra></extra>',
-                customdata=[self.node_levels.get(node, 0) for node in all_nodes]
+                customdata=[self.node_levels.get(node, 0) for node in all_nodes],
+                x=self._calculate_node_positions(all_nodes),
+                y=self._calculate_node_y_positions(all_nodes)
             ),
             link=dict(
                 source=source_indices,
                 target=target_indices,
                 value=values,
-                color=self.link_colors,
-                line=dict(color="rgba(0,0,0,0.3)", width=1),
+                color=transparent_link_colors,
+                line=dict(color="rgba(0,0,0,0)", width=0),
                 hovertemplate='<b>%{source.label}</b> → <b>%{target.label}</b><br>Value: %{value}<extra></extra>'
             )
         )])
@@ -255,21 +307,99 @@ class EnhancedSankeyChart:
         
         return fig
     
+    def _calculate_node_positions(self, all_nodes: List[str]) -> List[float]:
+        """
+        Calculate X positions for nodes based on their levels
+        
+        Args:
+            all_nodes: List of all node names
+            
+        Returns:
+            List of X positions (0-1 range)
+        """
+        x_positions = []
+        
+        for node in all_nodes:
+            level = self.node_levels.get(node, 0)
+            
+            if level == 0:
+                # Level 0 at 20% of working area
+                x_positions.append(0.2)
+            elif level == 1:
+                # Level 1 at 45% of working area
+                x_positions.append(0.45)
+            elif level == 2:
+                # Level 2 at 70% of working area
+                x_positions.append(0.7)
+            else:
+                # Default positioning for other levels
+                x_positions.append(0.5)
+        
+        return x_positions
+    
+    def _calculate_node_y_positions(self, all_nodes: List[str]) -> List[float]:
+        """
+        Calculate Y positions for nodes to distribute them evenly within each level
+        
+        Args:
+            all_nodes: List of all node names
+            
+        Returns:
+            List of Y positions (0-1 range)
+        """
+        # Group nodes by level
+        level_groups = {}
+        for i, node in enumerate(all_nodes):
+            level = self.node_levels.get(node, 0)
+            if level not in level_groups:
+                level_groups[level] = []
+            level_groups[level].append(i)
+        
+        y_positions = [0.0] * len(all_nodes)
+        
+        # Distribute nodes evenly within each level
+        for level, node_indices in level_groups.items():
+            if len(node_indices) == 1:
+                # Single node: center it
+                y_positions[node_indices[0]] = 0.5
+            else:
+                # Multiple nodes: distribute evenly
+                for i, node_idx in enumerate(node_indices):
+                    # Space nodes evenly with some padding
+                    spacing = 0.8 / (len(node_indices) - 1) if len(node_indices) > 1 else 0
+                    y_positions[node_idx] = 0.1 + (i * spacing)
+        
+        return y_positions
+    
     def _post_process_html(self, html_content: str) -> str:
-        """Post-process HTML to add alignment control button"""
-        # Add HTML comment and alignment control button
-        comment = "<!-- Sankey Chart Label Alignment Control -->"
+        """Post-process HTML to add styling and label positioning control"""
+        # Add HTML comment and control button
+        comment = "<!-- Sankey Chart Label Control -->"
         button_and_script = """
 <div style="position: fixed; top: 10px; right: 10px; z-index: 1000;">
-    <button id="alignLabelsBtn" onclick="fixLastLevelLabels()" 
+    <button id="fixLabelsBtn" onclick="fixAllLabels()" 
             style="background: #4CAF50; color: white; border: none; padding: 10px 15px; 
                    border-radius: 5px; cursor: pointer; font-size: 14px;">
-        Fix Last Level Labels
+        Fix All Labels
     </button>
 </div>
 
+<style>
+/* Basic label styling */
+.sankey-node text {
+    font-weight: bold !important;
+    filter: none !important;
+    text-shadow: none !important;
+}
+
+.sankey-node text tspan {
+    font-weight: bold !important;
+    fill: #2c3e50 !important;
+}
+</style>
+
 <script>
-function fixLastLevelLabels() {
+function fixAllLabels() {
     const nodes = document.querySelectorAll('.sankey-node');
     let fixedCount = 0;
     
@@ -283,7 +413,7 @@ function fixLastLevelLabels() {
         }
     });
     
-    // Fix labels for nodes at the rightmost position (last level)
+    // Fix labels for all nodes
     nodes.forEach(node => {
         const data = node.__data__;
         if (!data) return;
@@ -294,32 +424,40 @@ function fixLastLevelLabels() {
         const bbox = rect.getBoundingClientRect();
         const isRightmost = Math.abs(bbox.left - maxX) < 20;
         
+        const label = node.querySelector('text');
+        if (!label) return;
+        
+        // Position labels based on level
+        const rectY = bbox.top;
+        const rectHeight = bbox.height;
+        const centerY = rectY + (rectHeight / 2);
+        
         if (isRightmost) {
-            const label = node.querySelector('.node-label');
-            if (!label) return;
-            
-            // Position labels to the right and center them vertically
-            const rectY = bbox.top;
-            const rectHeight = bbox.height;
-            const centerY = rectY + (rectHeight / 2);
-            
+            // Last level: align to the right
             const offsetX = bbox.width + 10;
             const offsetY = centerY - rectY;
-            
             label.style.transform = `translate(${offsetX}px, ${offsetY}px)`;
             label.style.textAnchor = 'start';
             label.style.dominantBaseline = 'middle';
-            fixedCount++;
+        } else {
+            // Other levels: align to the left
+            const offsetX = -10;
+            const offsetY = centerY - rectY;
+            label.style.transform = `translate(${offsetX}px, ${offsetY}px)`;
+            label.style.textAnchor = 'end';
+            label.style.dominantBaseline = 'middle';
         }
+        
+        fixedCount++;
     });
     
     // Update button feedback
-    const btn = document.getElementById('alignLabelsBtn');
+    const btn = document.getElementById('fixLabelsBtn');
     if (btn) {
         btn.textContent = `Fixed ${fixedCount} labels`;
         btn.style.background = '#2196F3';
         setTimeout(() => {
-            btn.textContent = 'Fix Last Level Labels';
+            btn.textContent = 'Fix All Labels';
             btn.style.background = '#4CAF50';
         }, 2000);
     }
