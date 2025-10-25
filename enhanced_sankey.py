@@ -222,6 +222,8 @@ class EnhancedSankeyChart:
         targets = self.data['Target'].unique()
         all_nodes = list(set(sources) | set(targets))
         
+
+
         # Create node mapping
         node_map = {node: i for i, node in enumerate(all_nodes)}
         
