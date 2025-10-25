@@ -238,14 +238,8 @@ class EnhancedSankeyChart:
         for node in all_nodes:
             flow_total = self.node_flow_totals.get(node, 0)
             if flow_total > 0:
-                # Convert to thousands and format appropriately
-                flow_k = flow_total / 1000
-                if flow_k >= 1:
-                    # Show as k€ for values >= 1000
-                    enhanced_label = f"<b>{node}</b><br><span style='font-size:10px; font-weight:normal;'>{flow_k:.1f}k€</span>"
-                else:
-                    # Show as € for values < 1000
-                    enhanced_label = f"<b>{node}</b><br><span style='font-size:10px; font-weight:normal;'>{flow_total}€</span>"
+                # Data is already in k€, just add the suffix
+                enhanced_label = f"<b>{node}</b><br><span style='font-size:10px; font-weight:normal;'>{flow_total}k€</span>"
             else:
                 enhanced_label = f"<b>{node}</b>"
             enhanced_labels.append(enhanced_label)
