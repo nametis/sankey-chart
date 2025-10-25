@@ -1,0 +1,13 @@
+{
+  "group_colors": {
+    "Level_2_A": "#FF6B6B",
+    "Level_2_B": "#4ECDC4",
+    "Level_2_C": "#45B7D1",
+    "Level_2_D": "#DDA0DD",
+    "Level_2_E": "#96CEB4"
+  },
+  "manual_colors": {
+    "_example": "Level_1_B: #000000"
+  },
+  "default_color": "#808080"
+}
