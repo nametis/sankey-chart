@@ -1,3 +1,6 @@
+import polars as pl
+
+
 def _prepare_universe(
     lf_amounts, lf_centers, *,
     truth_entity, truth_code, status_col, active_value, ANCESTRY,
@@ -8,15 +11,18 @@ def _prepare_universe(
        Levels absent from amounts are backfilled from centers (matched rows directly,
        orphan rows via the nested hierarchy)."""
     KEY = ["entity", "project", "code"]
- 
+
+    # Collect centers ONCE. Reused below for both the deduped status/level table
+    # and the hierarchy backfill, so a lazy lf_centers pipeline runs a single time.
+    centers_raw = lf_centers.rename(
+        {truth_entity: "entity", truth_code: "code", status_col: "status"}
+    ).collect()
     centers = (
-        lf_centers.rename({truth_entity:"entity", truth_code:"code", status_col:"status"})
-        .group_by("entity", "code")
+        centers_raw.group_by("entity", "code")
         .agg((pl.col("status") == active_value).any().alias("is_active"),
              *[pl.col(c).first().alias(c) for c in ANCESTRY])
-        .collect()
     )
- 
+
     have    = set(lf_amounts.collect_schema().names())
     present = [(a, l) for a, l in zip(amt_levels, ANCESTRY) if a in have]
     missing = [l for a, l in zip(amt_levels, ANCESTRY) if a not in have]
@@ -28,7 +34,7 @@ def _prepare_universe(
         .agg(pl.col("amount").sum(), *[pl.col(l).first() for _, l in present])
         .collect()
     )
- 
+
     # every amount row: center match → center status+levels; orphan → inactive + amt levels
     c = {"is_active": "c_is_active", **{l: f"c_{l}" for l in ANCESTRY}}
     amt_rows = (
@@ -51,7 +57,7 @@ def _prepare_universe(
         .select(KEY + ["is_active"] + ANCESTRY + ["amount"])
     )
     universe = pl.concat([amt_rows, active_expanded])
- 
+
     # backfill levels missing from amounts on ORPHAN rows, via the nested hierarchy:
     # use the present level just finer than the missing block (e.g. level4) to look up
     # its coarser ancestors in centers (level4 → level3, level2, ...).
@@ -60,8 +66,8 @@ def _prepare_universe(
         # hierarchy. Fill the FINEST missing level first, then reuse it as an anchor
         # for coarser ones (chaining: level4→level3, then level3→level2). For each
         # target, try the finest available finer level whose value exists in centers.
-        src = lf_centers.rename({truth_entity: "entity", truth_code: "code", status_col: "status"})
-        cen_cols = set(src.collect_schema().names())
+        src = centers_raw                        # already renamed + collected once above
+        cen_cols = set(src.columns)
         for m in sorted(missing, key=ANCESTRY.index, reverse=True):     # finest missing first
             if m not in cen_cols:
                 continue
@@ -69,24 +75,24 @@ def _prepare_universe(
                             key=ANCESTRY.index, reverse=True):           # finest finer anchor first
                 if p not in cen_cols:
                     continue
-                anc = src.group_by(p).agg(pl.col(m).drop_nulls().first().alias("d_m")).collect()
+                anc = src.group_by(p).agg(pl.col(m).drop_nulls().first().alias("d_m"))
                 universe = (
                     universe.join(anc, on=p, how="left")
                     .with_columns(pl.coalesce(pl.col(m), pl.col("d_m")).alias(m))
                     .drop("d_m")
                 )
     return universe
- 
- 
+
+
 def _cascade(universe, *, ANCESTRY, FALLBACK, keep_empty):
     """Resolved universe (internal names) → (result, audit), scoped per (entity, project),
        distributing inactive amounts to active centers using grown amounts."""
     KEY  = ["entity", "project", "code"]
     path = lambda g: ["entity", "project"] + ANCESTRY[:ANCESTRY.index(g) + 1]
- 
+
     active   = universe.filter( pl.col("is_active"))
     inactive = universe.filter(~pl.col("is_active") & (pl.col("amount") != 0))
- 
+
     active_current, remaining, flows = active, inactive, []
     for g in FALLBACK:
         keys = path(g)
@@ -112,11 +118,11 @@ def _cascade(universe, *, ANCESTRY, FALLBACK, keep_empty):
         )
         flows.append(dist.select(KEY + ["received", pl.lit(g).alias("resolved_level")]))
         remaining = remaining.join(resolving.select(KEY), on=KEY, how="anti")
- 
+
     audit = (pl.concat(flows) if flows else pl.DataFrame(schema={
                 "entity":pl.Utf8,"project":pl.Utf8,"code":pl.Utf8,
                 "received":pl.Float64,"resolved_level":pl.Utf8}))
- 
+
     grown = active_current.select(KEY + [pl.col("amount").alias("_grown")])
     kept  = remaining.select(KEY).with_columns(pl.lit(True).alias("_kept"))
     result = (
