@@ -1,20 +1,16 @@
 import polars as pl
 
 
-def reallocate_v3(
+def _prepare_universe(
     lf_amounts, lf_centers, *,
-    truth_entity="Entity Code", truth_code="Mapped Centre", status_col="Active",
-    active_value=True, levels=("level1", "level4", "level5", "level6", "level7"),
-    coarsest_level="level6",
-    amt_entity="Local Entity Code", project_col="Project",
-    amt_code="AGG Center Code", amt_col="amount",
-    amt_levels=None, unmatched="inactive", keep_empty=False,
+    truth_entity, truth_code, status_col, active_value, ANCESTRY,
+    amt_entity, project_col, amt_code, amt_col, amt_levels, unmatched,
 ):
-    ANCESTRY = list(levels)
-    FALLBACK = list(reversed(ANCESTRY[ANCESTRY.index(coarsest_level):]))
-    amt_levels = list(levels if amt_levels is None else amt_levels)
-    KEY  = ["entity", "project", "code"]
-    path = lambda g: ["entity", "project"] + ANCESTRY[:ANCESTRY.index(g) + 1]
+    """Raw inputs → one resolved row per (entity, project, code) in INTERNAL names:
+       entity, project, code, is_active, *ANCESTRY, amount.
+       Levels absent from amounts are backfilled from centers (matched rows directly,
+       orphan rows via the nested hierarchy)."""
+    KEY = ["entity", "project", "code"]
 
     centers = (
         lf_centers.rename({truth_entity:"entity", truth_code:"code", status_col:"status"})
@@ -36,6 +32,7 @@ def reallocate_v3(
         .collect()
     )
 
+    # every amount row: center match → center status+levels; orphan → inactive + amt levels
     c = {"is_active": "c_is_active", **{l: f"c_{l}" for l in ANCESTRY}}
     amt_rows = (
         amt.join(centers.rename(c), on=["entity", "code"],
@@ -47,6 +44,7 @@ def reallocate_v3(
         )
         .select(KEY + ["is_active"] + ANCESTRY + ["amount"])
     )
+    # active centers expanded into every project of their entity (amount 0) → recipients
     ent_proj = amt.select("entity", "project").unique()
     active_expanded = (
         centers.filter(pl.col("is_active"))
@@ -57,13 +55,34 @@ def reallocate_v3(
     )
     universe = pl.concat([amt_rows, active_expanded])
 
+    # backfill levels missing from amounts on ORPHAN rows, via the nested hierarchy:
+    # use the present level just finer than the missing block (e.g. level4) to look up
+    # its coarser ancestors in centers (level4 → level3, level2, ...).
+    if missing:
+        last_missing = max(ANCESTRY.index(l) for l in missing)
+        finer = [l for l in ANCESTRY[last_missing + 1:] if l not in missing]
+        if finer:
+            dk = finer[0]
+            anc = (centers.select([dk] + missing).unique(subset=[dk])
+                   .rename({l: f"d_{l}" for l in missing}))
+            universe = (
+                universe.join(anc, on=dk, how="left")
+                .with_columns(*[pl.coalesce(pl.col(l), pl.col(f"d_{l}")).alias(l) for l in missing])
+                .drop([f"d_{l}" for l in missing])
+            )
+    return universe
+
+
+def _cascade(universe, *, ANCESTRY, FALLBACK, keep_empty):
+    """Resolved universe (internal names) → (result, audit), scoped per (entity, project),
+       distributing inactive amounts to active centers using grown amounts."""
+    KEY  = ["entity", "project", "code"]
+    path = lambda g: ["entity", "project"] + ANCESTRY[:ANCESTRY.index(g) + 1]
+
     active   = universe.filter( pl.col("is_active"))
     inactive = universe.filter(~pl.col("is_active") & (pl.col("amount") != 0))
 
-    # sequential reallocation, scoped by (entity, project); active grows in place
-    active_current = active
-    remaining      = inactive
-    flows = []
+    active_current, remaining, flows = active, inactive, []
     for g in FALLBACK:
         keys = path(g)
         g_stats = (active_current.group_by(keys)
@@ -89,19 +108,14 @@ def reallocate_v3(
         flows.append(dist.select(KEY + ["received", pl.lit(g).alias("resolved_level")]))
         remaining = remaining.join(resolving.select(KEY), on=KEY, how="anti")
 
-    # audit (per active center, per level it received at)
     audit = (pl.concat(flows) if flows else pl.DataFrame(schema={
                 "entity":pl.Utf8,"project":pl.Utf8,"code":pl.Utf8,
-                "received":pl.Float64,"resolved_level":pl.Utf8})
-             ).rename({"entity":truth_entity, "project":project_col, "code":truth_code})
+                "received":pl.Float64,"resolved_level":pl.Utf8}))
 
-    # output: active → grown amount (already in active_current); resolved inactive → 0; rest kept
-    grown    = active_current.select(KEY + [pl.col("amount").alias("_grown")])
-    resolved = remaining.select(KEY)        # inactive that never resolved → kept
+    grown = active_current.select(KEY + [pl.col("amount").alias("_grown")])
+    kept  = remaining.select(KEY).with_columns(pl.lit(True).alias("_kept"))
     result = (
-        universe
-        .join(grown, on=KEY, how="left")
-        .join(resolved.with_columns(pl.lit(True).alias("_kept")), on=KEY, how="left")
+        universe.join(grown, on=KEY, how="left").join(kept, on=KEY, how="left")
         .with_columns(
             pl.when(pl.col("is_active")).then(pl.col("_grown"))
               .when(pl.col("_kept").fill_null(False) | (pl.col("amount") == 0)).then(pl.col("amount"))
@@ -110,7 +124,33 @@ def reallocate_v3(
     )
     if not keep_empty:
         result = result.filter((pl.col("amount") != 0) | (pl.col("amount_active") != 0))
-    result = (result.select(KEY + ANCESTRY + ["is_active", "amount", "amount_active"])
-              .rename({"entity":truth_entity, "project":project_col,
-                       "code":truth_code, "is_active":status_col}))
-    return result.lazy(), audit.lazy()
+    result = result.select(KEY + ANCESTRY + ["is_active", "amount", "amount_active"])
+    return result, audit
+
+
+def reallocate_v3(
+    lf_amounts, lf_centers, *,
+    truth_entity="Entity Code", truth_code="Mapped Centre", status_col="Active",
+    active_value=True,
+    levels=("level1","level2","level3","level4","level5","level6","level7"),
+    fallback_levels=("level6","level5","level4","level3","level2","level1"),
+    amt_entity="Local Entity Code", project_col="Project",
+    amt_code="AGG Center Code", amt_col="amount",
+    amt_levels=None, unmatched="inactive", keep_empty=False,
+):
+    ANCESTRY = list(levels)
+    FALLBACK = list(fallback_levels)
+    amt_levels = list(levels if amt_levels is None else amt_levels)
+
+    universe = _prepare_universe(
+        lf_amounts, lf_centers,
+        truth_entity=truth_entity, truth_code=truth_code, status_col=status_col,
+        active_value=active_value, ANCESTRY=ANCESTRY,
+        amt_entity=amt_entity, project_col=project_col, amt_code=amt_code,
+        amt_col=amt_col, amt_levels=amt_levels, unmatched=unmatched,
+    )
+    result, audit = _cascade(universe, ANCESTRY=ANCESTRY, FALLBACK=FALLBACK, keep_empty=keep_empty)
+
+    rename_out = {"entity":truth_entity, "project":project_col, "code":truth_code}
+    return (result.rename({**rename_out, "is_active":status_col}).lazy(),
+            audit.rename(rename_out).lazy())
