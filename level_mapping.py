@@ -63,9 +63,15 @@ def _prepare_universe(
         finer = [l for l in ANCESTRY[last_missing + 1:] if l not in missing]
         if finer:
             dk = finer[0]
-            anc = (centers.drop_nulls([dk] + missing)        # only rows where key AND ancestors known
-                   .select([dk] + missing).unique(subset=[dk])
-                   .rename({l: f"d_{l}" for l in missing}))
+            # Derive each missing level independently, from the FULL centers input
+            # (pre-dedup, any status), taking the first NON-NULL value per key. This
+            # avoids dropping source rows that know only some of the missing levels.
+            anc = (
+                lf_centers.rename({truth_entity: "entity", truth_code: "code", status_col: "status"})
+                .group_by(dk)
+                .agg(*[pl.col(l).drop_nulls().first().alias(f"d_{l}") for l in missing])
+                .collect()
+            )
             universe = (
                 universe.join(anc, on=dk, how="left")
                 .with_columns(*[pl.coalesce(pl.col(l), pl.col(f"d_{l}")).alias(l) for l in missing])
