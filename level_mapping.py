@@ -63,7 +63,8 @@ def _prepare_universe(
         finer = [l for l in ANCESTRY[last_missing + 1:] if l not in missing]
         if finer:
             dk = finer[0]
-            anc = (centers.select([dk] + missing).unique(subset=[dk])
+            anc = (centers.drop_nulls([dk] + missing)        # only rows where key AND ancestors known
+                   .select([dk] + missing).unique(subset=[dk])
                    .rename({l: f"d_{l}" for l in missing}))
             universe = (
                 universe.join(anc, on=dk, how="left")
