@@ -1,101 +1,116 @@
 import polars as pl
 
 
-def reallocate_fast(
+def reallocate_v3(
     lf_amounts, lf_centers, *,
     truth_entity="Entity Code", truth_code="Mapped Centre", status_col="Active",
     active_value=True, levels=("level1", "level4", "level5", "level6", "level7"),
-    amt_entity="Local Entity Code", amt_code="AGG Center Code", amt_col="amount",
-    amt_levels=None, unmatched="inactive",          # "inactive" | "drop"
+    coarsest_level="level6",
+    amt_entity="Local Entity Code", project_col="Project",
+    amt_code="AGG Center Code", amt_col="amount",
+    amt_levels=None, unmatched="inactive", keep_empty=False,
 ):
     ANCESTRY = list(levels)
-    FALLBACK = list(reversed(ANCESTRY[1:]))          # level7 → level4
+    FALLBACK = list(reversed(ANCESTRY[ANCESTRY.index(coarsest_level):]))
     amt_levels = list(levels if amt_levels is None else amt_levels)
-    path = lambda g: ["entity"] + ANCESTRY[: ANCESTRY.index(g) + 1]
+    KEY  = ["entity", "project", "code"]
+    path = lambda g: ["entity", "project"] + ANCESTRY[:ANCESTRY.index(g) + 1]
 
-    # ── truth: one row per (entity, code); active if ANY row active ──────────
-    truth = (
-        lf_centers.rename({truth_entity: "entity", truth_code: "code", status_col: "status"})
+    centers = (
+        lf_centers.rename({truth_entity:"entity", truth_code:"code", status_col:"status"})
         .group_by("entity", "code")
         .agg((pl.col("status") == active_value).any().alias("is_active"),
              *[pl.col(c).first().alias(c) for c in ANCESTRY])
         .collect()
     )
 
-    # ── amounts: aggregate per (entity, code); carry hierarchy where present ─
     have    = set(lf_amounts.collect_schema().names())
     present = [(a, l) for a, l in zip(amt_levels, ANCESTRY) if a in have]
     missing = [l for a, l in zip(amt_levels, ANCESTRY) if a not in have]
     amt = (
-        lf_amounts.rename({amt_entity: "entity", amt_code: "code", amt_col: "amount",
+        lf_amounts.rename({amt_entity:"entity", project_col:"project",
+                           amt_code:"code", amt_col:"amount",
                            **{a: l for a, l in present if a != l}})
-        .group_by("entity", "code")
+        .group_by("entity", "project", "code")
         .agg(pl.col("amount").sum(), *[pl.col(l).first() for _, l in present])
         .collect()
     )
 
-    # ── universe: every amt row kept (orphans → inactive, amt levels); truth
-    #    match → truth levels + truth status; truth-only codes → amount 0.
-    #    full join = inactive mode, right join = drop mode (orphans excluded).
-    t = {"is_active": "t_is_active", **{l: f"t_{l}" for l in ANCESTRY}}
-    universe = (
-        amt.join(truth.rename(t), on=["entity", "code"], coalesce=True,
-                 how="full" if unmatched == "inactive" else "right")
+    c = {"is_active": "c_is_active", **{l: f"c_{l}" for l in ANCESTRY}}
+    amt_rows = (
+        amt.join(centers.rename(c), on=["entity", "code"],
+                 how="left" if unmatched == "inactive" else "inner")
         .with_columns(
-            pl.coalesce(pl.col("t_is_active"), pl.lit(False)).alias("is_active"),
-            pl.col("amount").fill_null(0.0),
-            *[(pl.coalesce(pl.col(f"t_{l}"), pl.col(l)) if l not in missing
-               else pl.col(f"t_{l}")).alias(l) for l in ANCESTRY],
+            pl.coalesce(pl.col("c_is_active"), pl.lit(False)).alias("is_active"),
+            *[(pl.coalesce(pl.col(f"c_{l}"), pl.col(l)) if l not in missing
+               else pl.col(f"c_{l}")).alias(l) for l in ANCESTRY],
         )
-        .select(["entity", "code", "is_active"] + ANCESTRY + ["amount"])
+        .select(KEY + ["is_active"] + ANCESTRY + ["amount"])
     )
+    ent_proj = amt.select("entity", "project").unique()
+    active_expanded = (
+        centers.filter(pl.col("is_active"))
+        .join(ent_proj, on="entity", how="inner")
+        .join(amt.select(KEY), on=KEY, how="anti")
+        .with_columns(pl.lit(0.0).alias("amount"))
+        .select(KEY + ["is_active"] + ANCESTRY + ["amount"])
+    )
+    universe = pl.concat([amt_rows, active_expanded])
 
-    active   = universe.filter(pl.col("is_active"))
+    active   = universe.filter( pl.col("is_active"))
     inactive = universe.filter(~pl.col("is_active") & (pl.col("amount") != 0))
 
-    # active group totals per granularity — computed once, reused twice
-    stats = {g: active.group_by(path(g)).agg(pl.col("amount").sum().alias("gtot"),
-                                             pl.len().alias("gcnt")) for g in FALLBACK}
-
-    # ── resolve each inactive center to its finest level with active present ─
-    inact = inactive
-    for g in FALLBACK:
-        inact = inact.join(stats[g].select(path(g) + [pl.col("gcnt").alias(f"h_{g}")]),
-                           on=path(g), how="left")
-    inact = inact.with_columns(
-        pl.coalesce([pl.when(pl.col(f"h_{g}") > 0).then(pl.lit(g)) for g in FALLBACK]).alias("level")
-    )
-
-    # ── distribute each group's inactive total across its active centers ─────
+    # sequential reallocation, scoped by (entity, project); active grows in place
+    active_current = active
+    remaining      = inactive
     flows = []
     for g in FALLBACK:
-        tot = (inact.filter(pl.col("level") == g).group_by(path(g))
-               .agg(pl.col("amount").sum().alias("inact_tot")))
-        flows.append(
-            active.select(path(g) + ["code", "amount"])
-            .join(stats[g], on=path(g)).join(tot, on=path(g))   # inner: only groups w/ inactive
-            .select("entity", "code",
-                    pl.when(pl.col("gtot") > 0)
-                      .then(pl.col("amount") * pl.col("inact_tot") / pl.col("gtot"))
-                      .otherwise(pl.col("inact_tot") / pl.col("gcnt")).alias("received"),
-                    pl.lit(g).alias("resolved_level"))
+        keys = path(g)
+        g_stats = (active_current.group_by(keys)
+                   .agg(pl.col("amount").sum().alias("gtot"), pl.len().alias("gcnt")))
+        resolving = remaining.join(g_stats.select(keys), on=keys, how="semi")
+        if resolving.is_empty():
+            continue
+        tot  = resolving.group_by(keys).agg(pl.col("amount").sum().alias("inact_tot"))
+        dist = (
+            active_current.select(keys + ["code", "amount"])
+            .join(g_stats, on=keys).join(tot, on=keys)
+            .with_columns(
+                pl.when(pl.col("gtot") > 0)
+                  .then(pl.col("amount") * pl.col("inact_tot") / pl.col("gtot"))
+                  .otherwise(pl.col("inact_tot") / pl.col("gcnt")).alias("received")
+            )
         )
-    audit = pl.concat(flows).rename({"entity": truth_entity, "code": truth_code})
-    recv  = (pl.concat(f.select("entity", "code", "received") for f in flows)
-             .group_by("entity", "code").agg(pl.col("received").sum()))
+        active_current = (
+            active_current.join(dist.select(KEY + ["received"]), on=KEY, how="left")
+            .with_columns((pl.col("amount") + pl.col("received").fill_null(0.0)).alias("amount"))
+            .drop("received")
+        )
+        flows.append(dist.select(KEY + ["received", pl.lit(g).alias("resolved_level")]))
+        remaining = remaining.join(resolving.select(KEY), on=KEY, how="anti")
 
-    # ── single output expression: active(+received) / reallocated(0) / kept ──
+    # audit (per active center, per level it received at)
+    audit = (pl.concat(flows) if flows else pl.DataFrame(schema={
+                "entity":pl.Utf8,"project":pl.Utf8,"code":pl.Utf8,
+                "received":pl.Float64,"resolved_level":pl.Utf8})
+             ).rename({"entity":truth_entity, "project":project_col, "code":truth_code})
+
+    # output: active → grown amount (already in active_current); resolved inactive → 0; rest kept
+    grown    = active_current.select(KEY + [pl.col("amount").alias("_grown")])
+    resolved = remaining.select(KEY)        # inactive that never resolved → kept
     result = (
         universe
-        .join(recv, on=["entity", "code"], how="left")
-        .join(inact.select("entity", "code", "level"), on=["entity", "code"], how="left")
+        .join(grown, on=KEY, how="left")
+        .join(resolved.with_columns(pl.lit(True).alias("_kept")), on=KEY, how="left")
         .with_columns(
-            pl.when(pl.col("is_active"))
-              .then(pl.col("amount") + pl.col("received").fill_null(0.0))
-              .when(pl.col("level").is_not_null()).then(0.0)
-              .otherwise(pl.col("amount")).alias("amount_active")
+            pl.when(pl.col("is_active")).then(pl.col("_grown"))
+              .when(pl.col("_kept").fill_null(False) | (pl.col("amount") == 0)).then(pl.col("amount"))
+              .otherwise(0.0).alias("amount_active")
         )
-        .select(["entity", "code"] + ANCESTRY + ["is_active", "amount", "amount_active"])
-        .rename({"entity": truth_entity, "code": truth_code, "is_active": status_col})
     )
+    if not keep_empty:
+        result = result.filter((pl.col("amount") != 0) | (pl.col("amount_active") != 0))
+    result = (result.select(KEY + ANCESTRY + ["is_active", "amount", "amount_active"])
+              .rename({"entity":truth_entity, "project":project_col,
+                       "code":truth_code, "is_active":status_col}))
     return result.lazy(), audit.lazy()
