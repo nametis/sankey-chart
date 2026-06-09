@@ -2,26 +2,22 @@ import polars as pl
 
 
 def _prepare_universe(
-    lf_amounts, lf_centers, lf_centers_mapp, *,
+    lf_amounts, lf_centers, *,
     truth_entity, truth_code, status_col, active_value, ANCESTRY,
-    amt_entity, project_col, amt_code, amt_col, amt_levels,
-    mapp_code, mapp_levels, unmatched,
+    amt_entity, project_col, amt_code, amt_col, amt_levels, unmatched,
 ):
     """Raw inputs → one resolved row per (entity, project, code) in INTERNAL names:
        entity, project, code, is_active, *ANCESTRY, amount.
 
-       Three sources, each with a single role:
-         • lf_centers      — status only: is_active per (entity, code).
-         • lf_centers_mapp — the hierarchy dictionary: full level path per code.
-                             Authoritative; supplies every level a code needs.
-         • lf_amounts      — amounts (+ whatever levels it happens to carry).
-       Levels are resolved by a join on the code: amounts' own levels are kept, and any
-       level amounts lacks is filled from the dictionary. If a code is NOT in the dictionary,
-       the remaining gaps are filled from the dictionary's unique child→parent relationships
-       (level4→level3, level3→level2), which are well-defined because level2/level3 are unique."""
+       Two sources:
+         • lf_centers — status only: is_active per (entity, code).
+         • lf_amounts — amounts AND the full level path (assumed already propagated).
+       Active centers that hold no amount in a project are expanded as zero-amount
+       recipient rows; their level path is taken from that code's own amount rows
+       (the hierarchy is intrinsic to the code)."""
     KEY = ["entity", "project", "code"]
 
-    # status per (entity, code) — that is all centers is used for now
+    # status per (entity, code)
     centers = (
         lf_centers.rename({truth_entity: "entity", truth_code: "code", status_col: "status"})
         .group_by("entity", "code")
@@ -29,17 +25,8 @@ def _prepare_universe(
         .collect()
     )
 
-    # the hierarchy dictionary: one full level path per code (no entity, no amount)
-    mapp = (
-        lf_centers_mapp.rename({mapp_code: "code",
-                                **{m: l for m, l in zip(mapp_levels, ANCESTRY) if m != l}})
-        .group_by("code")
-        .agg(*[pl.col(l).drop_nulls().first().alias(l) for l in ANCESTRY])
-        .collect()
-    )
-
-    have          = set(lf_amounts.collect_schema().names())
-    present       = [(a, l) for a, l in zip(amt_levels, ANCESTRY) if a in have]
+    have           = set(lf_amounts.collect_schema().names())
+    present        = [(a, l) for a, l in zip(amt_levels, ANCESTRY) if a in have]
     present_levels = [l for _, l in present]
     amt = (
         lf_amounts.rename({amt_entity:"entity", project_col:"project",
@@ -50,53 +37,33 @@ def _prepare_universe(
         .collect()
     )
 
-    # amount rows: attach status (orphan → inactive); carry amounts' own levels for now
+    # amount rows: attach status (orphan → inactive); levels come straight from amounts
     amt_rows = (
         amt.join(centers, on=["entity", "code"],
                  how="left" if unmatched == "inactive" else "inner")
         .with_columns(pl.col("is_active").fill_null(False))
         .select(KEY + ["is_active"] + present_levels + ["amount"])
     )
+    # one level path per code, taken from amounts → gives expanded recipients their hierarchy
+    code_levels = amt.group_by("code").agg(
+        *[pl.col(l).drop_nulls().first().alias(l) for l in present_levels])
     # active centers expanded into every project of their entity (amount 0) → recipients
     ent_proj = amt.select("entity", "project").unique()
     active_expanded = (
         centers.filter(pl.col("is_active"))
         .join(ent_proj, on="entity", how="inner")
         .join(amt.select(KEY), on=KEY, how="anti")
-        .with_columns(pl.lit(0.0).alias("amount"),
-                      *[pl.lit(None, dtype=amt.schema[l]).alias(l) for l in present_levels])
+        .join(code_levels, on="code", how="left")
+        .with_columns(pl.lit(0.0).alias("amount"))
         .select(KEY + ["is_active"] + present_levels + ["amount"])
     )
     universe = pl.concat([amt_rows, active_expanded])
 
-    # resolve the FULL level path from the mapping, keyed by code: keep amounts' own
-    # levels where present, fill everything else from the dictionary. One join, no chaining.
-    # (1) primary: full level path by code from the dictionary; keep amounts' own levels
-    universe = (
-        universe.join(mapp.rename({l: f"m_{l}" for l in ANCESTRY}), on="code", how="left")
-        .with_columns(*[
-            (pl.coalesce(pl.col(l), pl.col(f"m_{l}")) if l in present_levels
-             else pl.col(f"m_{l}")).alias(l)
-            for l in ANCESTRY
-        ])
-        .drop([f"m_{l}" for l in ANCESTRY])
-    )
-    # (2) fallback for codes the dictionary doesn't cover. level2/level3 are unique, so a
-    #     level value determines its parent: derive level3 from level4, then level2 from the
-    #     resolved level3 — using the dictionary's own (unique) child→parent pairs. Finest
-    #     missing first so a just-derived level can feed the next coarser one.
-    missing = [l for l in ANCESTRY if l not in present_levels]
-    for m in sorted(missing, key=ANCESTRY.index, reverse=True):
-        ci = ANCESTRY.index(m) + 1
-        if ci >= len(ANCESTRY):
-            continue
-        child = ANCESTRY[ci]                              # immediate finer level (level4 for level3)
-        cmap = mapp.group_by(child).agg(pl.col(m).drop_nulls().first().alias("d_m"))
-        universe = (
-            universe.join(cmap, on=child, how="left")
-            .with_columns(pl.coalesce(pl.col(m), pl.col("d_m")).alias(m))
-            .drop("d_m")
-        )
+    # guard: ensure every ANCESTRY level exists as a column for the cascade (null if amounts
+    # somehow lacked one), then fix column order
+    miss = [l for l in ANCESTRY if l not in present_levels]
+    if miss:
+        universe = universe.with_columns(*[pl.lit(None).alias(l) for l in miss])
     universe = universe.select(KEY + ["is_active"] + ANCESTRY + ["amount"])
     return universe
 
@@ -165,7 +132,7 @@ def _cascade(universe, *, ANCESTRY, FALLBACK, keep_empty):
 
 
 def reallocate_v3(
-    lf_amounts, lf_centers, lf_centers_mapp, *,
+    lf_amounts, lf_centers, *,
     truth_entity="Entity Code", truth_code="Mapped Centre", status_col="Active",
     active_value=True,
     levels=("level1","level2","level3","level4","level5","level6","level7"),
@@ -173,21 +140,18 @@ def reallocate_v3(
     amt_entity="Local Entity Code", project_col="Project",
     amt_code="AGG Center Code", amt_col="amount",
     amt_levels=None,
-    mapp_code="Mapped Centre", mapp_levels=None,
     unmatched="inactive", keep_empty=False,
 ):
-    ANCESTRY   = list(levels)
-    FALLBACK   = list(fallback_levels)
-    amt_levels  = list(levels if amt_levels  is None else amt_levels)
-    mapp_levels = list(levels if mapp_levels is None else mapp_levels)
+    ANCESTRY  = list(levels)
+    FALLBACK  = list(fallback_levels)
+    amt_levels = list(levels if amt_levels is None else amt_levels)
 
     universe = _prepare_universe(
-        lf_amounts, lf_centers, lf_centers_mapp,
+        lf_amounts, lf_centers,
         truth_entity=truth_entity, truth_code=truth_code, status_col=status_col,
         active_value=active_value, ANCESTRY=ANCESTRY,
         amt_entity=amt_entity, project_col=project_col, amt_code=amt_code,
-        amt_col=amt_col, amt_levels=amt_levels,
-        mapp_code=mapp_code, mapp_levels=mapp_levels, unmatched=unmatched,
+        amt_col=amt_col, amt_levels=amt_levels, unmatched=unmatched,
     )
     result, audit = _cascade(universe, ANCESTRY=ANCESTRY, FALLBACK=FALLBACK, keep_empty=keep_empty)
 
